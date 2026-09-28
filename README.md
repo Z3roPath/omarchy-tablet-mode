@@ -27,6 +27,8 @@ For four-finger gestures, install a Hyprgrass build matching your exact Hyprland
 Clone this repository and run as your regular desktop user:
 
 ```sh
+git clone https://github.com/Z3roPath/omarchy-tablet-mode.git
+cd omarchy-tablet-mode
 python3 install.py --dry-run --with-lock --with-polkit
 python3 install.py --with-lock --with-polkit
 ```
