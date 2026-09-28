@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unit=omarchy-tablet-mode-ui.service
+state_dir="$HOME/.local/state/omarchy-tablet-mode"
+reader_state="$state_dir/reader-before"
+keyboard_state="$state_dir/keyboard-before"
+hidden_state="$state_dir/bar-hidden"
+dock_before="$state_dir/dock-before"
+dock_state="$state_dir/dock-state"
+dock_interaction="$state_dir/dock-interaction"
+ui_path="$HOME/.local/share/omarchy-tablet-mode/ui"
+reader="${OMARCHY_TABLET_READER:-$HOME/.local/bin/omarchy-reader-mode}"
+[[ -x "$reader" ]] || reader="$HOME/.local/share/omarchy-tablet-mode/bin/reader-mode"
+keyboard_unit=tablet-keyboard.service
+
+active() { systemctl --user is-active --quiet "$unit"; }
+
+keyboard_visible() {
+  hyprctl -j layers | jq -e 'any(.[]?.levels[][]?; .namespace == "wvkbd")' >/dev/null 2>&1
+}
+
+keyboard_pid() {
+  systemctl --user show "$keyboard_unit" --property=MainPID --value
+}
+
+keyboard() {
+  local action="${1:-toggle}" pid signal wanted
+  case "$action" in
+    show)
+      systemctl --user start "$keyboard_unit"
+      signal=SIGUSR2; wanted=visible
+      ;;
+    hide)
+      systemctl --user is-active --quiet "$keyboard_unit" || return 0
+      signal=SIGUSR1; wanted=hidden
+      ;;
+    toggle)
+      systemctl --user start "$keyboard_unit"
+      if keyboard_visible; then signal=SIGUSR1; wanted=hidden; else signal=SIGUSR2; wanted=visible; fi
+      ;;
+    *) echo 'keyboard: use show, hide, or toggle' >&2; return 2 ;;
+  esac
+  pid="$(keyboard_pid)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo 'Keyboard service has no process' >&2; return 1; }
+  kill -"$signal" "$pid"
+  for attempt in {1..15}; do
+    if keyboard_visible; then
+      [[ "$wanted" == visible ]] && return 0
+    else
+      [[ "$wanted" == hidden ]] && return 0
+    fi
+    sleep 0.1
+  done
+  echo "Keyboard did not become $wanted" >&2
+  return 1
+}
+
+gesture() {
+  local direction="${1:-}" result=0 auth_result=""
+  mkdir -p "$state_dir"
+  printf '%s gesture %s received\n' "$(date -Is)" "$direction" >>"$state_dir/gesture.log"
+  case "$direction" in
+    show) auth_result="$(omarchy-shell tablet-auth showKeyboard 2>/dev/null || true)" ;;
+    hide) auth_result="$(omarchy-shell tablet-auth hideKeyboard 2>/dev/null || true)" ;;
+  esac
+  if [[ "$auth_result" == ok ]]; then
+    printf '%s gesture %s authentication-keyboard result=0\n' "$(date -Is)" "$direction" >>"$state_dir/gesture.log"
+    return 0
+  fi
+  case "$direction" in
+    show) enter && keyboard show || result=$? ;;
+    hide) keyboard hide || result=$? ;;
+    *) return 2 ;;
+  esac
+  printf '%s gesture %s result=%s\n' "$(date -Is)" "$direction" "$result" >>"$state_dir/gesture.log"
+  return "$result"
+}
+
+enter() {
+  active && return 0
+  mkdir -p "$state_dir"
+  echo visible >"$hidden_state"
+  "$reader" state >"$reader_state"
+  hyprctl getoption -j decoration:screen_shader | jq -r '.str' >"$state_dir/shader-before"
+  if keyboard_visible; then echo visible >"$keyboard_state"; else echo hidden >"$keyboard_state"; fi
+  if [[ -f "$HOME/.local/state/omarchy/toggles/bar-off" ]]; then echo hidden >"$dock_before"; else echo visible >"$dock_before"; fi
+  if ! systemctl --user start "$unit"; then
+    rm -f "$reader_state" "$keyboard_state" "$hidden_state" "$dock_before"
+    return 1
+  fi
+  dock hide
+}
+
+exit_mode() {
+  active || return 0
+  if [[ -f "$keyboard_state" && "$(cat "$keyboard_state")" == visible ]]; then
+    keyboard show || true
+  else
+    keyboard hide || true
+  fi
+  if [[ -f "$state_dir/shader-before" ]]; then
+    hyprctl eval "hl.config({ decoration = { screen_shader = $(jq -Rs 'rtrimstr("\n")' <"$state_dir/shader-before") } })" >/dev/null
+  elif [[ -f "$reader_state" ]]; then
+    case "$(cat "$reader_state")" in
+      normal) "$reader" off; "$reader" cycle ;;
+      inverted) "$reader" off; "$reader" cycle; "$reader" flip ;;
+      off) "$reader" off ;;
+    esac
+  fi
+  systemctl --user stop "$unit"
+  restore_dock
+  rm -f "$reader_state" "$keyboard_state"
+  rm -f "$hidden_state" "$dock_before" "$dock_state" "$dock_interaction" "$state_dir/shader-before"
+}
+
+restore_dock() {
+  [[ -f "$dock_before" ]] || return 0
+  if [[ "$(cat "$dock_before")" == hidden ]]; then omarchy-toggle-bar on; else omarchy-toggle-bar off; fi
+}
+
+dock() {
+  active || return 0
+  mkdir -p "$state_dir"
+  case "${1:-}" in
+    reveal)
+      echo released >"$dock_interaction"
+      echo visible >"$dock_state"
+      omarchy-toggle-bar off
+      ;;
+    hide)
+      echo hidden >"$dock_state"
+      echo released >"$dock_interaction"
+      omarchy-toggle-bar on
+      ;;
+    interaction)
+      [[ "${2:-}" == held || "${2:-}" == released ]] || return 2
+      echo "$2" >"$dock_interaction"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+bar() {
+  local direction="${1:-}" method
+  case "$direction" in
+    reveal)
+      if ! active; then enter; fi
+      echo visible >"$hidden_state"
+      method=revealBar
+      ;;
+    hide)
+      active || return 0
+      mkdir -p "$state_dir"
+      echo hidden >"$hidden_state"
+      method=hideBar
+      ;;
+    *) return 2 ;;
+  esac
+  for attempt in {1..15}; do
+    if qs ipc -p "$ui_path" call tablet "$method" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+dock_toggle() {
+  local now previous=0
+  mkdir -p "$state_dir"
+  exec 9>"$state_dir/dock.lock"
+  flock -n 9 || return 0
+  now="$(date +%s%3N)"
+  if [[ -f "$state_dir/last-dock-tap" ]]; then previous="$(cat "$state_dir/last-dock-tap")"; fi
+  [[ "$previous" =~ ^[0-9]+$ ]] || previous=0
+  (( now - previous >= 650 )) || return 0
+  printf '%s' "$now" >"$state_dir/last-dock-tap"
+  if active; then
+    if [[ -f "$hidden_state" && "$(cat "$hidden_state")" == hidden ]]; then bar reveal; else exit_mode; fi
+  else
+    enter
+  fi
+}
+
+action() {
+  active || return 0
+  case "${1:-}" in
+    launcher) omarchy-shell shell toggle omarchy.menu '{"menu":"root"}' ;;
+    browser) omarchy-launch-browser ;;
+    files) uwsm-app -- xdg-open "$HOME" ;;
+    terminal) omarchy-launch-terminal ;;
+    reader) "$reader" cycle ;;
+    keyboard) keyboard toggle ;;
+    previous) hyprctl dispatch 'hl.dsp.focus({ workspace = "-1" })' ;;
+    next) hyprctl dispatch 'hl.dsp.focus({ workspace = "+1" })' ;;
+    exit) exit_mode ;;
+    *) echo 'Unknown tablet action' >&2; return 2 ;;
+  esac
+}
+
+case "${1:-toggle}" in
+  enter) enter ;;
+  exit) exit_mode ;;
+  toggle) if active; then exit_mode; else enter; fi ;;
+  dock-toggle) dock_toggle ;;
+  status) if active; then echo on; else echo off; fi ;;
+  bar-status)
+    if active; then
+      printf '{"text":"TM","tooltip":"Tablet Mode is on. Tap to exit.","class":"active"}\n'
+    else
+      printf '{"text":"TM","tooltip":"Tablet Mode. Tap for large touch controls."}\n'
+    fi
+    ;;
+  keyboard) keyboard "${2:-toggle}" ;;
+  gesture) gesture "${2:-}" ;;
+  bar) bar "${2:-}" ;;
+  dock) dock "${2:-}" "${3:-}" ;;
+  restore-dock) restore_dock ;;
+  bindings-ready) mkdir -p "$state_dir"; date -Is >"$state_dir/bindings-ready" ;;
+  action) action "${2:-}" ;;
+  *) echo 'Usage: tablet-mode [enter|exit|toggle|status|keyboard show|keyboard hide|action NAME]' >&2; exit 2 ;;
+esac

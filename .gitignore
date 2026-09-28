@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+review/login/theme/
+review/login/*.proposed.qml
+review/login/*.patch
+review/login/*.conf.proposed
+review/login/preview.png
+repair*.py
+dist/
+*.log

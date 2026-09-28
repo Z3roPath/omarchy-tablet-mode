@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+shader="$HOME/.local/share/omarchy-tablet-mode/assets/shaders/eink-reader.frag"
+inverted_shader="$HOME/.local/share/omarchy-tablet-mode/assets/shaders/eink-reader-inverted.frag"
+current="$(hyprctl getoption -j decoration:screen_shader | jq -r '.str')"
+
+set_shader() {
+  hyprctl eval "hl.config({ decoration = { screen_shader = '$1' } })" >/dev/null
+}
+
+choose_shader() {
+  # Pick light paper for a dark screen, and keep light pages light.
+  local brightness
+  if ! brightness="$(grim -t ppm - | magick ppm:- -resize '1x1!' -colorspace Gray -format '%[fx:mean]' info: 2>/dev/null)"; then
+    brightness=1
+  fi
+  if awk -v value="$brightness" 'BEGIN { exit !(value < 0.5) }'; then
+    printf '%s' "$inverted_shader"
+  else
+    printf '%s' "$shader"
+  fi
+}
+
+case "${1:-toggle}" in
+  state)
+    if [[ "$current" == "$shader" ]]; then
+      echo normal
+    elif [[ "$current" == "$inverted_shader" ]]; then
+      echo inverted
+    else
+      echo off
+    fi
+    ;;
+  cycle)
+    if [[ "$current" == "$shader" ]]; then
+      set_shader "$inverted_shader"
+    elif [[ "$current" == "$inverted_shader" ]]; then
+      set_shader ''
+    else
+      set_shader "$shader"
+    fi
+    ;;
+  status)
+    if [[ "$current" == "$shader" || "$current" == "$inverted_shader" ]]; then
+      echo on
+    else
+      echo off
+    fi
+    ;;
+  on)
+    if [[ "$current" != "$shader" && "$current" != "$inverted_shader" ]]; then
+      set_shader "$(choose_shader)"
+    fi
+    ;;
+  off)
+    if [[ "$current" == "$shader" || "$current" == "$inverted_shader" ]]; then
+      set_shader ''
+    fi
+    ;;
+  toggle)
+    if [[ "$current" == "$shader" || "$current" == "$inverted_shader" ]]; then
+      set_shader ''
+    else
+      set_shader "$(choose_shader)"
+    fi
+    ;;
+  flip)
+    if [[ "$current" == "$shader" ]]; then
+      set_shader "$inverted_shader"
+    elif [[ "$current" == "$inverted_shader" ]]; then
+      set_shader "$shader"
+    else
+      echo 'Reader mode is off' >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo 'Usage: omarchy-reader-mode [on|off|toggle|flip|cycle|state|status]' >&2
+    exit 2
+    ;;
+esac
